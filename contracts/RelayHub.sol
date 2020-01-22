@@ -1,4 +1,5 @@
 pragma solidity ^0.5.5;
+pragma experimental ABIEncoderV2;
 
 import "./IRelayHub.sol";
 import "./IRelayRecipient.sol";
@@ -192,40 +193,34 @@ contract RelayHub is IRelayHub {
     }
 
     function canRelay(
-        address relay,
-        address from,
-        address to,
-        bytes memory encodedFunction,
-        uint256 transactionFee,
-        uint256 gasPrice,
-        uint256 gasLimit,
-        uint256 nonce,
-        bytes memory signature,
-        bytes memory approvalData
+        CallData memory callData,
+        RelayData memory relayData
     )
     public view returns (uint256 status, bytes memory recipientContext)
     {
         // Verify the sender's signature on the transaction - note that approvalData is *not* signed
         {
-            bytes memory packed = abi.encodePacked("rlx:", from, to, encodedFunction, transactionFee, gasPrice, gasLimit, nonce, address(this));
-            bytes32 hashedMessage = keccak256(abi.encodePacked(packed, relay));
+            bytes memory packed = abi.encodePacked("rlx:", relayData.senderAccount, callData.target,
+                callData.encodedFunction, relayData.pctRelayFee, callData.gasPrice,
+                callData.gasLimit, relayData.senderNonce, address(this));
+            bytes32 hashedMessage = keccak256(abi.encodePacked(packed, relayData.relayAddress));
 
-            if (hashedMessage.toEthSignedMessageHash().recover(signature) != from) {
+            if (hashedMessage.toEthSignedMessageHash().recover(relayData.signature) != relayData.senderAccount) {
                 return (uint256(PreconditionCheck.WrongSignature), "");
             }
         }
 
         // Verify the transaction is not being replayed
-        if (nonces[from] != nonce) {
+        if (nonces[relayData.senderAccount] != relayData.senderNonce) {
             return (uint256(PreconditionCheck.WrongNonce), "");
         }
 
-        uint256 maxCharge = maxPossibleCharge(gasLimit, gasPrice, transactionFee);
-        bytes memory encodedTx = abi.encodeWithSelector(IRelayRecipient(to).acceptRelayedCall.selector,
-            relay, from, encodedFunction, transactionFee, gasPrice, gasLimit, nonce, approvalData, maxCharge
+        uint256 maxCharge = maxPossibleCharge(callData.gasLimit, callData.gasPrice, relayData.pctRelayFee);
+        bytes memory encodedTx = abi.encodeWithSelector(IRelayRecipient(callData.target).acceptRelayedCall.selector,
+            relayData.relayAddress, relayData.senderAccount, callData.encodedFunction, relayData.pctRelayFee, callData.gasPrice, callData.gasLimit, relayData.senderNonce, relayData.approvalData, maxCharge
         );
 
-        (bool success, bytes memory returndata) = to.staticcall.gas(acceptRelayedCallMaxGas)(encodedTx);
+        (bool success, bytes memory returndata) = callData.target.staticcall.gas(acceptRelayedCallMaxGas)(encodedTx);
 
         if (!success) {
             return (uint256(PreconditionCheck.AcceptRelayedCallReverted), "");
@@ -245,27 +240,11 @@ contract RelayHub is IRelayHub {
     /**
      * @notice Relay a transaction.
      *
-     * @param from the client originating the request.
-     * @param recipient the target IRelayRecipient contract.
-     * @param encodedFunction the function call to relay.
-     * @param transactionFee fee (%) the relay takes over actual gas cost.
-     * @param gasPrice gas price the client is willing to pay
-     * @param gasLimit limit the client want to put on its transaction
-     * @param transactionFee fee (%) the relay takes over actual gas cost.
-     * @param nonce sender's nonce (in nonces[])
-     * @param signature client's signature over all params except approvalData
-     * @param approvalData dapp-specific data
      */
     function relayCall(
-        address from,
-        address recipient,
-        bytes memory encodedFunction,
-        uint256 transactionFee,
-        uint256 gasPrice,
-        uint256 gasLimit,
-        uint256 nonce,
-        bytes memory signature,
-        bytes memory approvalData
+        CallData memory callData,
+    // TODO: msg.sender used to be treated as 'relay' (now passed in a struct), make sure this does not have security impl
+        RelayData memory relayData
     )
     public
     {
@@ -279,24 +258,24 @@ contract RelayHub is IRelayHub {
         // A relay may use a higher gas price than the one requested by the signer (to e.g. get the transaction in a
         // block faster), but it must not be lower. The recipient will be charged for the requested gas price, not the
         // one used in the transaction.
-        require(gasPrice <= tx.gasprice, "Invalid gas price");
+        require(callData.gasPrice <= tx.gasprice, "Invalid gas price");
 
         // This transaction must have enough gas to forward the call to the recipient with the requested amount, and not
         // run out of gas later in this function.
-        require(initialGas >= SafeMath.sub(requiredGas(gasLimit), gasOverhead), "Not enough gasleft()");
+        require(initialGas >= SafeMath.sub(requiredGas(callData.gasLimit), gasOverhead), "Not enough gasleft()");
 
         // We don't yet know how much gas will be used by the recipient, so we make sure there are enough funds to pay
         // for the maximum possible charge.
-        require(maxPossibleCharge(gasLimit, gasPrice, transactionFee) <= balances[recipient], "Recipient balance too low");
+        require(maxPossibleCharge(callData.gasLimit, callData.gasPrice, relayData.pctRelayFee) <= balances[callData.target], "Recipient balance too low");
 
-        bytes4 functionSelector = LibBytes.readBytes4(encodedFunction, 0);
+        bytes4 functionSelector = LibBytes.readBytes4(callData.encodedFunction, 0);
 
         bytes memory recipientContext;
         {
             // We now verify the legitimacy of the transaction (it must be signed by the sender, and not be replayed),
             // and that the recpient will accept to be charged by it.
             uint256 preconditionCheck;
-            (preconditionCheck, recipientContext) = canRelay(msg.sender, from, recipient, encodedFunction, transactionFee, gasPrice, gasLimit, nonce, signature, approvalData);
+            (preconditionCheck, recipientContext) = canRelay(callData, relayData);
 
             if (preconditionCheck != uint256(PreconditionCheck.OK)) {
                 emit CanRelayFailed(msg.sender, from, recipient, functionSelector, preconditionCheck);
