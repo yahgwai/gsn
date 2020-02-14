@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"gen/librelay"
+	"gen/testcontracts"
 	"librelay/txstore"
 	"log"
 	"math/big"
@@ -457,11 +458,52 @@ func (relay *RelayServer) CreateRelayTransaction(request RelayTransactionRequest
 		log.Println(err, request.RelayMaxNonce)
 		return
 	}
+	// canRelay returned true, so we can relay the tx
+	relayAddress := relay.Address()
+
+	callOpt := &bind.CallOpts{
+		From:    relayAddress,
+		Pending: false,
+	}
+
+	// With a transition to sponsor-defined gas limits, the server will need to crunch some numbers
+	sponsor, err := testcontracts.NewTestSponsor(request.GasSponsor, relay.Client)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	gasLimits, err := sponsor.GetGasLimitsForSponsorCalls(&bind.CallOpts{From: relayAddress})
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	GAS_OVERHEAD_TOTAL := big.NewInt(0) // TODO: read from contract
+	maxPossibleGas := big.NewInt(0)
+	maxPossibleGas.Add(maxPossibleGas, GAS_OVERHEAD_TOTAL)
+	maxPossibleGas.Add(maxPossibleGas, gasLimits.AcceptRelayCallGasLimit)
+	maxPossibleGas.Add(maxPossibleGas, gasLimits.PreRelayCallGasLimit)
+	maxPossibleGas.Add(maxPossibleGas, &request.GasLimit)
+	maxPossibleGas.Add(maxPossibleGas, gasLimits.PostRelayCallGasLimit)
+	/*
+	 * Adding the exact gas cost of the encoded function and approval data as they are dynamic parameters in the relayed call.
+	 * While the signature is also byte array, it is checked off chain during canRelay() so any size other than 65 bytes will get reverted on "WrongSignature"
+	 */
+	// TODO: well, this sucks! I need to calculate max possible gas using entire msg.data!!!
+	maxPossibleGas.Add(maxPossibleGas, getEncodedFunctionMaxGas(request.EncodedFunction))
+	maxPossibleGas.Add(maxPossibleGas, getEncodedFunctionMaxGas(common.Bytes2Hex(request.ApprovalData)))
+
+	maxCharge, err := relay.rhub.CalculateCharge(callOpt, maxPossibleGas, &request.GasPrice, &request.RelayFee)
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
 	// check canRelay view function to see if we'll get paid for relaying this tx
 	res, err := relay.canRelay(request.From,
 		request.To,
 		request.GasSponsor,
+		maxCharge,
+		gasLimits.AcceptRelayCallGasLimit,
 		request.EncodedFunction,
 		request.RelayFee,
 		request.GasPrice,
@@ -485,32 +527,6 @@ func (relay *RelayServer) CreateRelayTransaction(request RelayTransactionRequest
 		return
 	}
 
-	// canRelay returned true, so we can relay the tx
-	relayAddress := relay.Address()
-
-	callOpt := &bind.CallOpts{
-		From:    relayAddress,
-		Pending: false,
-	}
-
-	requiredGas, err := relay.rhub.RequiredGas(callOpt, &request.GasLimit)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	/*
-	 * Adding the exact gas cost of the encoded function and approval data as they arethe only dynamic parameters in the relayed call.
-	 * While the signature is also byte array, it is checked off chain during canRelay() so any size other than 65 bytes will get reverted on "WrongSignature"
-	*/
-	requiredGas.Add(requiredGas, getEncodedFunctionGas(request.EncodedFunction))
-	requiredGas.Add(requiredGas, getEncodedFunctionGas(common.Bytes2Hex(request.ApprovalData)))
-
-	maxCharge, err := relay.rhub.MaxPossibleCharge(callOpt, &request.GasLimit, &request.GasPrice, &request.RelayFee)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
 	sponsorBalance, err := relay.rhub.BalanceOf(callOpt, request.GasSponsor)
 	if err != nil {
 		log.Println(err)
@@ -530,21 +546,21 @@ func (relay *RelayServer) CreateRelayTransaction(request RelayTransactionRequest
 		return
 	}
 
-	log.Println("Estimated max charge of relayed tx:", maxCharge, "GasLimit of relayed tx:", requiredGas)
+	log.Println("Estimated max charge of relayed tx:", maxCharge, "GasLimit of relayed tx:", maxPossibleGas)
 
 	signedTx, err = relay.sendDataTransaction(
 		fmt.Sprintf("Relay(from=%s, to=%s)", request.From.Hex(), request.To.Hex()),
 		func(auth *bind.TransactOpts) (*types.Transaction, error) {
-			auth.GasLimit = requiredGas.Uint64()
+			auth.GasLimit = maxPossibleGas.Uint64()
 			auth.GasPrice = &request.GasPrice
-			relayRequest := librelay.EIP712SigRelayRequest{
-				CallData:  librelay.EIP712SigCallData{
+			relayRequest := librelay.GSNTypesRelayRequest{
+				CallData:  librelay.GSNTypesCallData{
 					Target:          request.To,
 					GasLimit:        &request.GasLimit,
 					GasPrice:        &request.GasPrice,
 					EncodedFunction: common.Hex2Bytes(request.EncodedFunction[2:]),
 				},
-				RelayData: librelay.EIP712SigRelayData{
+				RelayData: librelay.GSNTypesRelayData{
 					SenderAccount: request.From,
 					SenderNonce:   &request.SenderNonce,
 					RelayAddress:  relay.Address(),
@@ -585,6 +601,8 @@ func (relay *RelayServer) GetPort() string {
 func (relay *RelayServer) canRelay(from common.Address,
 	to common.Address,
 	gasSponsor common.Address,
+	maxPossibleCharge *big.Int,
+	acceptRelayedCallMaxGas *big.Int,
 	encodedFunction string,
 	relayFee big.Int,
 	gasPrice big.Int,
@@ -605,14 +623,14 @@ func (relay *RelayServer) canRelay(from common.Address,
 		RecipientContext []byte
 	}
 
-	relayRequest := librelay.EIP712SigRelayRequest{
-		CallData:  librelay.EIP712SigCallData{
+	relayRequest := librelay.GSNTypesRelayRequest{
+		CallData:  librelay.GSNTypesCallData{
 			Target:          to,
 			GasLimit:        &gasLimit,
 			GasPrice:        &gasPrice,
 			EncodedFunction: common.Hex2Bytes(encodedFunction[2:]),
 		},
-		RelayData: librelay.EIP712SigRelayData{
+		RelayData: librelay.GSNTypesRelayData{
 			SenderAccount: from,
 			SenderNonce:   &senderNonce,
 			RelayAddress:  relayAddress,
@@ -620,7 +638,7 @@ func (relay *RelayServer) canRelay(from common.Address,
 			GasSponsor:    gasSponsor,
 		},
 	}
-	result, err = relay.rhub.CanRelay(callOpt, relayRequest, signature, approvalData)
+	result, err = relay.rhub.CanRelay(callOpt, relayRequest,maxPossibleCharge, acceptRelayedCallMaxGas, signature, approvalData)
 	if err != nil {
 		log.Println(err)
 	} else {
@@ -874,6 +892,13 @@ func (relay *RelayServer) Close() (err error) {
 	return relay.TxStore.Close()
 }
 
+/**
+ * It is going to be too expensive to run the estimate on-chain, so in the meantime
+ * the encoded function cost calculation is going to be a little... Approximate
+ */
+func getEncodedFunctionMaxGas(encodedFunction string) (*big.Int) {
+	return big.NewInt(int64(len(encodedFunction) * 68))
+}
 /**
  * @return Gas cost of encoded function as parameter in relayedCall
  * As per the yellowpaper, each non-zero byte costs 68 and zero byte costs 4

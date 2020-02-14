@@ -33,7 +33,7 @@ contract TestSponsorConfigurableMisbehavior is TestSponsorEverythingAccepted {
 
 
     function acceptRelayedCall(
-        EIP712Sig.RelayRequest calldata relayRequest,
+        GSNTypes.RelayRequest calldata relayRequest,
         bytes calldata approvalData,
         uint256 maxPossibleCharge
     )

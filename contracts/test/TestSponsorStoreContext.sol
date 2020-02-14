@@ -33,7 +33,7 @@ contract TestSponsorStoreContext is TestSponsorEverythingAccepted {
      * This demonstrates how acceptRelayedCall can return 'context' data for reuse in preRelayedCall/postRelayedCall.
      */
     function acceptRelayedCall(
-        EIP712Sig.RelayRequest calldata relayRequest,
+        GSNTypes.RelayRequest calldata relayRequest,
         bytes calldata approvalData,
         uint256 maxPossibleCharge
     )
